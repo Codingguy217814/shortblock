@@ -1,0 +1,253 @@
+name: Build ShortBlock
+on: [push, workflow_dispatch]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: 8.7 }
+      - name: Write project
+        run: |
+          mkdir -p proj/.
+          cat > proj/settings.gradle.kts <<'EOF_SB'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "ShortBlock"
+          include(":app")
+          EOF_SB
+          mkdir -p proj/.
+          cat > proj/build.gradle.kts <<'EOF_SB'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_SB
+          mkdir -p proj/.
+          cat > proj/gradle.properties <<'EOF_SB'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          EOF_SB
+          mkdir -p proj/app
+          cat > proj/app/build.gradle.kts <<'EOF_SB'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.shortblock"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.shortblock"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_SB
+          mkdir -p proj/app/src/main
+          cat > proj/app/src/main/AndroidManifest.xml <<'EOF_SB'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:label="ShortBlock" android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".BlockerService"
+                      android:exported="true"
+                      android:label="ShortBlock"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService"/>
+                      </intent-filter>
+                      <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility_config"/>
+                  </service>
+              </application>
+          </manifest>
+          EOF_SB
+          mkdir -p proj/app/src/main/res/xml
+          cat > proj/app/src/main/res/xml/accessibility_config.xml <<'EOF_SB'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewSelected"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="250"
+              android:description="@string/desc"
+              android:packageNames="com.instagram.android,com.snapchat.android,com.android.chrome,com.sec.android.app.sbrowser,org.mozilla.firefox,com.brave.browser,com.microsoft.emmx,com.opera.browser"/>
+          EOF_SB
+          mkdir -p proj/app/src/main/res/values
+          cat > proj/app/src/main/res/values/strings.xml <<'EOF_SB'
+          <resources>
+              <string name="desc">Leaves Reels, Explore and Spotlight screens automatically.</string>
+          </resources>
+          EOF_SB
+          mkdir -p proj/app/src/main/java/com/shortblock
+          cat > proj/app/src/main/java/com/shortblock/BlockerService.kt <<'EOF_SB'
+          package com.shortblock
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Context
+          import android.content.SharedPreferences
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          class BlockerService : AccessibilityService() {
+              private var last = 0L
+
+              private val browsers = setOf(
+                  "com.android.chrome", "com.sec.android.app.sbrowser", "org.mozilla.firefox",
+                  "com.brave.browser", "com.microsoft.emmx", "com.opera.browser"
+              )
+              private val urlIds = listOf("url_bar", "location_bar_edit_text", "mozac_browser_toolbar_url_view", "url_bar_title")
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {
+                  val pkg = e?.packageName?.toString() ?: return
+                  val p = getSharedPreferences("prefs", Context.MODE_PRIVATE)
+                  if (!p.getBoolean("enabled", true)) return
+                  val now = System.currentTimeMillis()
+                  if (now - last < 700) return
+                  val root = rootInActiveWindow ?: return
+                  val hit = try {
+                      when {
+                          pkg == "com.instagram.android" -> instagram(root, p)
+                          pkg == "com.snapchat.android" -> snapchat(root, p)
+                          pkg in browsers -> browser(root, pkg, p)
+                          else -> false
+                      }
+                  } catch (_: Exception) { false }
+                  if (hit) last = now
+              }
+
+              override fun onInterrupt() {}
+
+              private fun instagram(root: AccessibilityNodeInfo, p: SharedPreferences): Boolean {
+                  fun sel(id: String) = root.findAccessibilityNodeInfosByViewId("com.instagram.android:id/$id").any { it.isSelected }
+                  val reels = p.getBoolean("ig_reels", true) && sel("clips_tab")
+                  val explore = p.getBoolean("ig_explore", true) && sel("search_tab")
+                  if (!reels && !explore) return false
+                  val home = root.findAccessibilityNodeInfosByViewId("com.instagram.android:id/feed_tab").firstOrNull()
+                  if (home == null || !click(home)) performGlobalAction(GLOBAL_ACTION_BACK)
+                  return true
+              }
+
+              private fun snapchat(root: AccessibilityNodeInfo, p: SharedPreferences): Boolean {
+                  if (!p.getBoolean("snap_spotlight", true)) return false
+                  find(root, 0) { it.isSelected && label(it).equals("Spotlight", true) } ?: return false
+                  val target = find(root, 0) { label(it).let { l -> l.equals("Camera", true) || l.equals("Chat", true) } }
+                  if (target == null || !click(target)) performGlobalAction(GLOBAL_ACTION_BACK)
+                  return true
+              }
+
+              private fun browser(root: AccessibilityNodeInfo, pkg: String, p: SharedPreferences): Boolean {
+                  for (id in urlIds) {
+                      for (n in root.findAccessibilityNodeInfosByViewId("$pkg:id/$id")) {
+                          val url = (n.text ?: "").toString().lowercase()
+                          if (url.isEmpty()) continue
+                          val bad = (p.getBoolean("web_reels", true) && (url.contains("instagram.com/reel"))) ||
+                              (p.getBoolean("web_explore", true) && url.contains("instagram.com/explore")) ||
+                              (p.getBoolean("web_spotlight", true) && url.contains("snapchat.com/spotlight"))
+                          if (bad) { performGlobalAction(GLOBAL_ACTION_BACK); return true }
+                      }
+                  }
+                  return false
+              }
+
+              private fun label(n: AccessibilityNodeInfo) = (n.contentDescription ?: n.text ?: "").toString()
+
+              private fun find(n: AccessibilityNodeInfo?, depth: Int, pred: (AccessibilityNodeInfo) -> Boolean): AccessibilityNodeInfo? {
+                  if (n == null || depth > 25) return null
+                  if (pred(n)) return n
+                  for (i in 0 until n.childCount) find(n.getChild(i), depth + 1, pred)?.let { return it }
+                  return null
+              }
+
+              private fun click(n: AccessibilityNodeInfo): Boolean {
+                  var c: AccessibilityNodeInfo? = n
+                  while (c != null) {
+                      if (c.isClickable && c.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+                      c = c.parent
+                  }
+                  return false
+              }
+          }
+          EOF_SB
+          mkdir -p proj/app/src/main/java/com/shortblock
+          cat > proj/app/src/main/java/com/shortblock/MainActivity.kt <<'EOF_SB'
+          package com.shortblock
+
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.ViewGroup
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              private lateinit var status: TextView
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val prefs = getSharedPreferences("prefs", Context.MODE_PRIVATE)
+                  val d = resources.displayMetrics.density
+                  val pad = (20 * d).toInt()
+                  val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pad, pad * 2, pad, pad) }
+
+                  col.addView(TextView(this).apply { text = "ShortBlock"; textSize = 28f })
+                  status = TextView(this).apply { textSize = 15f; setPadding(0, pad / 2, 0, pad / 2) }
+                  col.addView(status)
+                  col.addView(Button(this).apply {
+                      text = "Open Accessibility Settings"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  })
+
+                  val items = listOf(
+                      "enabled" to "Master switch",
+                      "ig_reels" to "Instagram Reels (app)",
+                      "ig_explore" to "Instagram Explore (app)",
+                      "snap_spotlight" to "Snapchat Spotlight (app)",
+                      "web_reels" to "Instagram Reels (browser)",
+                      "web_explore" to "Instagram Explore (browser)",
+                      "web_spotlight" to "Snapchat Spotlight (browser)"
+                  )
+                  for ((key, name) in items) {
+                      col.addView(Switch(this).apply {
+                          text = name; textSize = 17f
+                          isChecked = prefs.getBoolean(key, true)
+                          setPadding(0, pad / 2, 0, pad / 2)
+                          setOnCheckedChangeListener { _, v -> prefs.edit().putBoolean(key, v).apply() }
+                      }, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                  }
+                  setContentView(ScrollView(this).apply { addView(col) })
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  val on = (Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: "")
+                      .contains(packageName)
+                  status.text = if (on) "Status: ON and blocking" else "Status: OFF. Turn on ShortBlock in Accessibility > Installed apps."
+              }
+          }
+          EOF_SB
+      - name: Build
+        run: cd proj && gradle assembleDebug --no-daemon
+      - name: Publish APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp proj/app/build/outputs/apk/debug/app-debug.apk ShortBlock.apk
+          gh release create "v${{ github.run_number }}" ShortBlock.apk --repo "${{ github.repository }}" --title "ShortBlock build ${{ github.run_number }}" --notes "Install ShortBlock.apk"
