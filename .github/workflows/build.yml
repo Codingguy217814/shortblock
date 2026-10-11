@@ -37,16 +37,27 @@ jobs:
               id("com.android.application")
               id("org.jetbrains.kotlin.android")
           }
+          val verCode = (project.findProperty("verCode") as String?)?.toInt() ?: 1
           android {
               namespace = "com.shortblock"
               compileSdk = 34
+              signingConfigs {
+                  create("rel") {
+                      storeFile = rootProject.file("release.p12")
+                      storePassword = "shortblock"
+                      keyAlias = "sb"
+                      keyPassword = "shortblock"
+                      storeType = "pkcs12"
+                  }
+              }
               defaultConfig {
                   applicationId = "com.shortblock"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = verCode
+                  versionName = "1.$verCode"
               }
+              buildTypes { getByName("debug") { signingConfig = signingConfigs.getByName("rel") } }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
                   targetCompatibility = JavaVersion.VERSION_17
@@ -58,6 +69,15 @@ jobs:
           cat > proj/app/src/main/AndroidManifest.xml <<'EOF_SB'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.VIEW"/>
+                      <category android:name="android.intent.category.BROWSABLE"/>
+                      <data android:scheme="https"/>
+                  </intent>
+              </queries>
               <application android:label="ShortBlock" android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
                   <activity android:name=".MainActivity" android:exported="true">
                       <intent-filter>
@@ -83,11 +103,10 @@ jobs:
           <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
               android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewSelected"
               android:accessibilityFeedbackType="feedbackGeneric"
-              android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows"
+              android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
               android:canRetrieveWindowContent="true"
               android:notificationTimeout="250"
-              android:description="@string/desc"
-              android:packageNames="com.instagram.android,com.snapchat.android,com.android.chrome,com.sec.android.app.sbrowser,org.mozilla.firefox,com.brave.browser,com.microsoft.emmx,com.opera.browser"/>
+              android:description="@string/desc"/>
           EOF_SB
           mkdir -p proj/app/src/main/res/values
           cat > proj/app/src/main/res/values/strings.xml <<'EOF_SB'
@@ -101,21 +120,31 @@ jobs:
 
           import android.accessibilityservice.AccessibilityService
           import android.content.Context
+          import android.content.Intent
           import android.content.SharedPreferences
+          import android.content.pm.PackageManager
+          import android.graphics.Rect
           import android.view.accessibility.AccessibilityEvent
           import android.view.accessibility.AccessibilityNodeInfo
 
           class BlockerService : AccessibilityService() {
               private var last = 0L
 
-              private val browsers = setOf(
+              private var browsers: Set<String> = setOf(
                   "com.android.chrome", "com.sec.android.app.sbrowser", "org.mozilla.firefox",
-                  "com.brave.browser", "com.microsoft.emmx", "com.opera.browser"
+                  "com.brave.browser", "com.microsoft.emmx", "com.opera.browser", "com.duckduckgo.mobile.android"
               )
-              private val urlIds = listOf("url_bar", "location_bar_edit_text", "mozac_browser_toolbar_url_view", "url_bar_title")
+
+              override fun onServiceConnected() {
+                  try {
+                      val i = Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_BROWSER)
+                      browsers = browsers + packageManager.queryIntentActivities(i, PackageManager.MATCH_ALL).map { it.activityInfo.packageName }
+                  } catch (_: Exception) {}
+              }
 
               override fun onAccessibilityEvent(e: AccessibilityEvent?) {
                   val pkg = e?.packageName?.toString() ?: return
+                  if (pkg != "com.instagram.android" && pkg != "com.snapchat.android" && pkg != "com.google.android.youtube" && pkg !in browsers) return
                   val p = getSharedPreferences("prefs", Context.MODE_PRIVATE)
                   if (!p.getBoolean("enabled", true)) return
                   val now = System.currentTimeMillis()
@@ -125,6 +154,7 @@ jobs:
                       when {
                           pkg == "com.instagram.android" -> instagram(root, p)
                           pkg == "com.snapchat.android" -> snapchat(root, p)
+                          pkg == "com.google.android.youtube" -> youtube(root, p)
                           pkg in browsers -> browser(root, pkg, p)
                           else -> false
                       }
@@ -136,8 +166,9 @@ jobs:
 
               private fun instagram(root: AccessibilityNodeInfo, p: SharedPreferences): Boolean {
                   fun sel(id: String) = root.findAccessibilityNodeInfosByViewId("com.instagram.android:id/$id").any { it.isSelected }
-                  val reels = p.getBoolean("ig_reels", true) && sel("clips_tab")
-                  val explore = p.getBoolean("ig_explore", true) && sel("search_tab")
+                  fun selLabel(vararg names: String) = find(root, 0) { n -> n.isSelected && names.any { label(n).startsWith(it, true) } } != null
+                  val reels = p.getBoolean("ig_reels", true) && (sel("clips_tab") || selLabel("Reels"))
+                  val explore = p.getBoolean("ig_explore", true) && (sel("search_tab") || selLabel("Search and explore"))
                   if (!reels && !explore) return false
                   val home = root.findAccessibilityNodeInfosByViewId("com.instagram.android:id/feed_tab").firstOrNull()
                   if (home == null || !click(home)) performGlobalAction(GLOBAL_ACTION_BACK)
@@ -146,24 +177,49 @@ jobs:
 
               private fun snapchat(root: AccessibilityNodeInfo, p: SharedPreferences): Boolean {
                   if (!p.getBoolean("snap_spotlight", true)) return false
-                  find(root, 0) { it.isSelected && label(it).equals("Spotlight", true) } ?: return false
-                  val target = find(root, 0) { label(it).let { l -> l.equals("Camera", true) || l.equals("Chat", true) } }
-                  if (target == null || !click(target)) performGlobalAction(GLOBAL_ACTION_BACK)
+                  val h = resources.displayMetrics.heightPixels
+                  val hit = find(root, 0) { n ->
+                      label(n).equals("Spotlight", true) && (n.isSelected || n.isChecked || run {
+                          val r = Rect(); n.getBoundsInScreen(r); r.top < h * 0.25 && r.bottom > 0
+                      })
+                  }
+                  if (hit == null) return false
+                  performGlobalAction(GLOBAL_ACTION_BACK)
+                  return true
+              }
+
+              private fun youtube(root: AccessibilityNodeInfo, p: SharedPreferences): Boolean {
+                  if (!p.getBoolean("yt_shorts", true)) return false
+                  val inShorts = root.findAccessibilityNodeInfosByViewId("com.google.android.youtube:id/reel_player_page_container").isNotEmpty() ||
+                      find(root, 0) { n -> n.isSelected && label(n).equals("Shorts", true) } != null
+                  if (!inShorts) return false
+                  performGlobalAction(GLOBAL_ACTION_BACK)
                   return true
               }
 
               private fun browser(root: AccessibilityNodeInfo, pkg: String, p: SharedPreferences): Boolean {
-                  for (id in urlIds) {
-                      for (n in root.findAccessibilityNodeInfosByViewId("$pkg:id/$id")) {
-                          val url = (n.text ?: "").toString().lowercase()
-                          if (url.isEmpty()) continue
-                          val bad = (p.getBoolean("web_reels", true) && (url.contains("instagram.com/reel"))) ||
-                              (p.getBoolean("web_explore", true) && url.contains("instagram.com/explore")) ||
-                              (p.getBoolean("web_spotlight", true) && url.contains("snapchat.com/spotlight"))
-                          if (bad) { performGlobalAction(GLOBAL_ACTION_BACK); return true }
-                      }
+                  val h = resources.displayMetrics.heightPixels
+                  val urls = ArrayList<String>()
+                  collect(root, 0, h, urls)
+                  for (url in urls) {
+                      val bad = (p.getBoolean("web_reels", true) && url.contains("instagram.com/reel")) ||
+                          (p.getBoolean("web_explore", true) && url.contains("instagram.com/explore")) ||
+                          (p.getBoolean("web_spotlight", true) && url.contains("snapchat.com/spotlight")) ||
+                          (p.getBoolean("web_all_ig", true) && url.contains("instagram.com")) ||
+                          (p.getBoolean("web_other", true) && (url.contains("youtube.com/shorts") || url.contains("tiktok.com") || url.contains("facebook.com/reel")))
+                      if (bad) { performGlobalAction(GLOBAL_ACTION_BACK); return true }
                   }
                   return false
+              }
+
+              private fun collect(n: AccessibilityNodeInfo?, depth: Int, h: Int, out: MutableList<String>) {
+                  if (n == null || depth > 25) return
+                  val t = (n.text ?: n.contentDescription ?: "").toString().lowercase()
+                  if (t.length in 5..300 && (t.contains("instagram.com") || t.contains("snapchat.com") || t.contains("youtube.com") || t.contains("tiktok.com") || t.contains("facebook.com"))) {
+                      val r = Rect(); n.getBoundsInScreen(r)
+                      if (r.top < h * 0.3) out.add(t)
+                  }
+                  for (i in 0 until n.childCount) collect(n.getChild(i), depth + 1, h, out)
               }
 
               private fun label(n: AccessibilityNodeInfo) = (n.contentDescription ?: n.text ?: "").toString()
@@ -199,6 +255,7 @@ jobs:
 
           class MainActivity : Activity() {
               private lateinit var status: TextView
+              private lateinit var upd: TextView
 
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
@@ -222,7 +279,10 @@ jobs:
                       "snap_spotlight" to "Snapchat Spotlight (app)",
                       "web_reels" to "Instagram Reels (browser)",
                       "web_explore" to "Instagram Explore (browser)",
-                      "web_spotlight" to "Snapchat Spotlight (browser)"
+                      "web_spotlight" to "Snapchat Spotlight (browser)",
+                      "web_all_ig" to "Block ALL Instagram in browser",
+                      "web_other" to "YouTube Shorts / TikTok / Facebook Reels (browser)",
+                      "yt_shorts" to "YouTube Shorts (app)"
                   )
                   for ((key, name) in items) {
                       col.addView(Switch(this).apply {
@@ -232,6 +292,8 @@ jobs:
                           setOnCheckedChangeListener { _, v -> prefs.edit().putBoolean(key, v).apply() }
                       }, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
                   }
+                  col.addView(TextView(this).apply { text = "Checking for updates..."; textSize = 14f; setPadding(0, pad, 0, 0); upd = this })
+                  Updater.check(this) { upd.text = it }
                   setContentView(ScrollView(this).apply { addView(col) })
               }
 
@@ -243,8 +305,74 @@ jobs:
               }
           }
           EOF_SB
+          mkdir -p proj/app/src/main/java/com/shortblock
+          cat > proj/app/src/main/java/com/shortblock/Updater.kt <<'EOF_SB'
+          package com.shortblock
+
+          import android.app.Activity
+          import android.app.DownloadManager
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.net.Uri
+          import android.os.Build
+          import org.json.JSONObject
+          import java.io.File
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          object Updater {
+              const val REPO = "REPO_PLACEHOLDER"
+
+              @Suppress("DEPRECATION")
+              fun check(act: Activity, status: (String) -> Unit) {
+                  Thread {
+                      try {
+                          val c = URL("https://api.github.com/repos/$REPO/releases/latest").openConnection() as HttpURLConnection
+                          c.setRequestProperty("Accept", "application/vnd.github+json")
+                          c.connectTimeout = 8000; c.readTimeout = 8000
+                          val j = JSONObject(c.inputStream.bufferedReader().readText())
+                          val latest = j.getString("tag_name").removePrefix("v").toInt()
+                          val cur = act.packageManager.getPackageInfo(act.packageName, 0).versionCode
+                          if (latest > cur) {
+                              val url = j.getJSONArray("assets").getJSONObject(0).getString("browser_download_url")
+                              act.runOnUiThread { status("Downloading update (build $latest)..."); download(act, url) }
+                          } else act.runOnUiThread { status("Up to date (build $cur)") }
+                      } catch (e: Exception) {
+                          act.runOnUiThread { status("Update check failed (repo must be public)") }
+                      }
+                  }.start()
+              }
+
+              private fun download(act: Activity, url: String) {
+                  val dm = act.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                  File(act.getExternalFilesDir(null), "update.apk").delete()
+                  val id = dm.enqueue(
+                      DownloadManager.Request(Uri.parse(url))
+                          .setTitle("ShortBlock update")
+                          .setDestinationInExternalFilesDir(act, null, "update.apk")
+                  )
+                  val r = object : BroadcastReceiver() {
+                      override fun onReceive(ctx: Context, i: Intent) {
+                          if (i.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1) != id) return
+                          act.unregisterReceiver(this)
+                          val uri = dm.getUriForDownloadedFile(id) ?: return
+                          ctx.startActivity(
+                              Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
+                                  .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                          )
+                      }
+                  }
+                  val f = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
+                  if (Build.VERSION.SDK_INT >= 33) act.registerReceiver(r, f, Context.RECEIVER_EXPORTED) else act.registerReceiver(r, f)
+              }
+          }
+          EOF_SB
+          echo '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' | base64 -d > proj/release.p12
+          sed -i "s#REPO_PLACEHOLDER#${{ github.repository }}#" proj/app/src/main/java/com/shortblock/Updater.kt
       - name: Build
-        run: cd proj && gradle assembleDebug --no-daemon
+        run: cd proj && gradle assembleDebug --no-daemon -PverCode=${{ github.run_number }}
       - name: Publish APK
         env:
           GH_TOKEN: ${{ github.token }}
