@@ -85,6 +85,7 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER"/>
                       </intent-filter>
                   </activity>
+                  <receiver android:name=".InstallReceiver" android:exported="false"/>
                   <service android:name=".BlockerService"
                       android:exported="true"
                       android:label="ShortBlock"
@@ -124,6 +125,8 @@ jobs:
           import android.content.SharedPreferences
           import android.content.pm.PackageManager
           import android.graphics.Rect
+          import android.os.Handler
+          import android.os.Looper
           import android.view.accessibility.AccessibilityEvent
           import android.view.accessibility.AccessibilityNodeInfo
 
@@ -135,7 +138,15 @@ jobs:
                   "com.brave.browser", "com.microsoft.emmx", "com.opera.browser", "com.duckduckgo.mobile.android"
               )
 
+              private val loop = object : Runnable {
+                  override fun run() {
+                      Updater.check(applicationContext)
+                      Handler(Looper.getMainLooper()).postDelayed(this, 6 * 60 * 60 * 1000L)
+                  }
+              }
+
               override fun onServiceConnected() {
+                  Handler(Looper.getMainLooper()).postDelayed(loop, 15000)
                   try {
                       val i = Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_BROWSER)
                       browsers = browsers + packageManager.queryIntentActivities(i, PackageManager.MATCH_ALL).map { it.activityInfo.packageName }
@@ -176,14 +187,16 @@ jobs:
               }
 
               private fun snapchat(root: AccessibilityNodeInfo, p: SharedPreferences): Boolean {
-                  if (!p.getBoolean("snap_spotlight", true)) return false
                   val h = resources.displayMetrics.heightPixels
-                  val hit = find(root, 0) { n ->
+                  val spot = p.getBoolean("snap_spotlight", true) && find(root, 0) { n ->
                       label(n).equals("Spotlight", true) && (n.isSelected || n.isChecked || run {
                           val r = Rect(); n.getBoundsInScreen(r); r.top < h * 0.25 && r.bottom > 0
                       })
-                  }
-                  if (hit == null) return false
+                  } != null
+                  val disc = p.getBoolean("snap_discover", true) && find(root, 0) { n ->
+                      label(n).equals("Discover", true) && n.isVisibleToUser
+                  } != null
+                  if (!spot && !disc) return false
                   performGlobalAction(GLOBAL_ACTION_BACK)
                   return true
               }
@@ -248,6 +261,7 @@ jobs:
           import android.app.Activity
           import android.content.Context
           import android.content.Intent
+          import android.net.Uri
           import android.os.Bundle
           import android.provider.Settings
           import android.view.ViewGroup
@@ -277,6 +291,7 @@ jobs:
                       "ig_reels" to "Instagram Reels (app)",
                       "ig_explore" to "Instagram Explore (app)",
                       "snap_spotlight" to "Snapchat Spotlight (app)",
+                      "snap_discover" to "Snapchat Discover (app)",
                       "web_reels" to "Instagram Reels (browser)",
                       "web_explore" to "Instagram Explore (browser)",
                       "web_spotlight" to "Snapchat Spotlight (browser)",
@@ -293,12 +308,17 @@ jobs:
                       }, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
                   }
                   col.addView(TextView(this).apply { text = "Checking for updates..."; textSize = 14f; setPadding(0, pad, 0, 0); upd = this })
+                  col.addView(Button(this).apply {
+                      text = "Allow auto-update"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName"))) }
+                  })
                   Updater.check(this) { upd.text = it }
                   setContentView(ScrollView(this).apply { addView(col) })
               }
 
               override fun onResume() {
                   super.onResume()
+                  if (::upd.isInitialized && packageManager.canRequestPackageInstalls()) Updater.check(this) { upd.text = it }
                   val on = (Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: "")
                       .contains(packageName)
                   status.text = if (on) "Status: ON and blocking" else "Status: OFF. Turn on ShortBlock in Accessibility > Installed apps."
@@ -309,63 +329,70 @@ jobs:
           cat > proj/app/src/main/java/com/shortblock/Updater.kt <<'EOF_SB'
           package com.shortblock
 
-          import android.app.Activity
-          import android.app.DownloadManager
+          import android.app.PendingIntent
           import android.content.BroadcastReceiver
           import android.content.Context
           import android.content.Intent
-          import android.content.IntentFilter
-          import android.net.Uri
+          import android.content.pm.PackageInstaller
           import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
           import org.json.JSONObject
-          import java.io.File
           import java.net.HttpURLConnection
           import java.net.URL
 
           object Updater {
               const val REPO = "REPO_PLACEHOLDER"
+              private val main = Handler(Looper.getMainLooper())
 
               @Suppress("DEPRECATION")
-              fun check(act: Activity, status: (String) -> Unit) {
+              fun check(ctx: Context, status: (String) -> Unit = {}) {
+                  val app = ctx.applicationContext
                   Thread {
                       try {
                           val c = URL("https://api.github.com/repos/$REPO/releases/latest").openConnection() as HttpURLConnection
                           c.setRequestProperty("Accept", "application/vnd.github+json")
-                          c.connectTimeout = 8000; c.readTimeout = 8000
+                          c.connectTimeout = 10000; c.readTimeout = 10000
                           val j = JSONObject(c.inputStream.bufferedReader().readText())
                           val latest = j.getString("tag_name").removePrefix("v").toInt()
-                          val cur = act.packageManager.getPackageInfo(act.packageName, 0).versionCode
+                          val cur = app.packageManager.getPackageInfo(app.packageName, 0).versionCode
                           if (latest > cur) {
-                              val url = j.getJSONArray("assets").getJSONObject(0).getString("browser_download_url")
-                              act.runOnUiThread { status("Downloading update (build $latest)..."); download(act, url) }
-                          } else act.runOnUiThread { status("Up to date (build $cur)") }
+                              if (!app.packageManager.canRequestPackageInstalls()) {
+                                  main.post { status("Update $latest ready. Tap 'Allow auto-update' below.") }
+                                  return@Thread
+                              }
+                              main.post { status("Installing update (build $latest)...") }
+                              install(app, j.getJSONArray("assets").getJSONObject(0).getString("browser_download_url"))
+                          } else main.post { status("Up to date (build $cur)") }
                       } catch (e: Exception) {
-                          act.runOnUiThread { status("Update check failed (repo must be public)") }
+                          main.post { status("Update check failed (repo must be public)") }
                       }
                   }.start()
               }
 
-              private fun download(act: Activity, url: String) {
-                  val dm = act.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-                  File(act.getExternalFilesDir(null), "update.apk").delete()
-                  val id = dm.enqueue(
-                      DownloadManager.Request(Uri.parse(url))
-                          .setTitle("ShortBlock update")
-                          .setDestinationInExternalFilesDir(act, null, "update.apk")
-                  )
-                  val r = object : BroadcastReceiver() {
-                      override fun onReceive(ctx: Context, i: Intent) {
-                          if (i.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1) != id) return
-                          act.unregisterReceiver(this)
-                          val uri = dm.getUriForDownloadedFile(id) ?: return
-                          ctx.startActivity(
-                              Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
-                                  .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-                          )
-                      }
+              private fun install(ctx: Context, url: String) {
+                  val conn = URL(url).openConnection() as HttpURLConnection
+                  conn.connectTimeout = 15000; conn.readTimeout = 60000
+                  val pi = ctx.packageManager.packageInstaller
+                  val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
+                  if (Build.VERSION.SDK_INT >= 31) params.setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED)
+                  val id = pi.createSession(params)
+                  val s = pi.openSession(id)
+                  conn.inputStream.use { inp -> s.openWrite("update.apk", 0, -1).use { out -> inp.copyTo(out); s.fsync(out) } }
+                  val pend = PendingIntent.getBroadcast(ctx, id, Intent(ctx, InstallReceiver::class.java).setPackage(ctx.packageName), PendingIntent.FLAG_MUTABLE)
+                  s.commit(pend.intentSender)
+                  s.close()
+              }
+          }
+
+          class InstallReceiver : BroadcastReceiver() {
+              @Suppress("DEPRECATION")
+              override fun onReceive(c: Context, i: Intent) {
+                  if (i.getIntExtra(PackageInstaller.EXTRA_STATUS, -1) == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+                      val conf = i.getParcelableExtra<Intent>(Intent.EXTRA_INTENT) ?: return
+                      conf.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      c.startActivity(conf)
                   }
-                  val f = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
-                  if (Build.VERSION.SDK_INT >= 33) act.registerReceiver(r, f, Context.RECEIVER_EXPORTED) else act.registerReceiver(r, f)
               }
           }
           EOF_SB
